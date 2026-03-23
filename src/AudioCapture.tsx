@@ -295,7 +295,7 @@ export default function AudioCapture() {
 
       try {
         dispatch({ type: "UPLOADING_SEGMENT" });
-        await stopAndUploadCurrentSegment(false);
+        await stopCurrentSegmentAndContinue(false);
         if (!pausedRef.current && !stoppingRef.current) {
           dispatch({ type: "START" });
           scheduleSegmentRotation();
@@ -340,7 +340,9 @@ export default function AudioCapture() {
     []
   );
 
-  const stopAndUploadCurrentSegment = useCallback(
+  const pendingUploadsRef = useRef<Promise<void>[]>([]);
+
+  const stopCurrentSegmentAndContinue = useCallback(
     async (finalSegment: boolean) => {
       const mr = activeRecorderRef.current;
       const sessionId = sessionIdRef.current;
@@ -381,20 +383,30 @@ export default function AudioCapture() {
         }
       });
 
-      currentSegmentChunksRef.current = [];
-      activeRecorderRef.current = null;
+    currentSegmentChunksRef.current = [];
+    activeRecorderRef.current = null;
 
-      if (blob.size > 0) {
-        await uploadSegment(sessionId, blob, currentIndex);
-        segmentIndexRef.current += 1;
-      }
+    // IMPORTANT: restart capture immediately before upload
+    if (!finalSegment && activeStreamRef.current && !pausedRef.current && !stoppingRef.current) {
+      await startSegmentRecorder(activeStreamRef.current, mimeType);
+    }
 
-      if (!finalSegment && activeStreamRef.current && !pausedRef.current && !stoppingRef.current) {
-        await startSegmentRecorder(activeStreamRef.current, mimeType);
-      }
-    },
-    [startSegmentRecorder, uploadSegment]
-  );
+    if (blob.size > 0) {
+      const uploadPromise = uploadSegment(sessionId, blob, currentIndex)
+        .then(() => {
+          console.log(`Uploaded segment ${currentIndex}`);
+        })
+        .catch((error) => {
+          console.error(`Failed to upload segment ${currentIndex}`, error);
+          throw error;
+        });
+
+      pendingUploadsRef.current.push(uploadPromise);
+      segmentIndexRef.current += 1;
+    }
+  },
+  [startSegmentRecorder, uploadSegment]
+);
 
   const handleStart = useCallback(async () => {
     try {
@@ -444,7 +456,7 @@ export default function AudioCapture() {
 
       try {
         dispatch({ type: "UPLOADING_SEGMENT" });
-        await stopAndUploadCurrentSegment(true);
+        await stopCurrentSegmentAndContinue(true);
         dispatch({ type: "PAUSE" });
       } catch (error) {
         dispatch({
@@ -488,8 +500,11 @@ export default function AudioCapture() {
 
       if (status === "recording" || status === "uploading_segment") {
         dispatch({ type: "UPLOADING_SEGMENT" });
-        await stopAndUploadCurrentSegment(true);
+        await stopCurrentSegmentAndContinue(true);
       }
+
+      await Promise.allSettled(pendingUploadsRef.current);
+      pendingUploadsRef.current = [];
 
       dispatch({ type: "FINALIZING" });
       await finalizeSession(sessionId);
