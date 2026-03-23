@@ -191,6 +191,7 @@ export default function AudioCapture() {
   const stoppingRef = useRef<boolean>(false);
   const pausedRef = useRef<boolean>(false);
   const currentMimeTypeRef = useRef<string>("audio/webm");
+  const pendingUploadsRef = useRef<Promise<void>[]>([]);
 
   const clearTimers = useCallback(() => {
     if (tickerRef.current !== null) {
@@ -209,6 +210,7 @@ export default function AudioCapture() {
     activeStreamRef.current = null;
     activeRecorderRef.current = null;
     currentSegmentChunksRef.current = [];
+    pendingUploadsRef.current = [];
     audioCtxRef.current?.close().catch(() => {});
     audioCtxRef.current = null;
     setAnalyser(null);
@@ -238,8 +240,8 @@ export default function AudioCapture() {
       const ext = blob.type.includes("ogg")
         ? "ogg"
         : blob.type.includes("mp4")
-        ? "mp4"
-        : "webm";
+          ? "mp4"
+          : "webm";
 
       form.append("audio", blob, `segment-${segmentIndex}.${ext}`);
       form.append("segmentIndex", String(segmentIndex));
@@ -286,30 +288,6 @@ export default function AudioCapture() {
     }
   }, []);
 
-  const scheduleSegmentRotation = useCallback(() => {
-    if (pausedRef.current || stoppingRef.current) return;
-
-    segmentTimerRef.current = window.setTimeout(async () => {
-      const sessionId = sessionIdRef.current;
-      if (!sessionId || pausedRef.current || stoppingRef.current) return;
-
-      try {
-        dispatch({ type: "UPLOADING_SEGMENT" });
-        await stopCurrentSegmentAndContinue(false);
-        if (!pausedRef.current && !stoppingRef.current) {
-          dispatch({ type: "START" });
-          scheduleSegmentRotation();
-        }
-      } catch (error) {
-        dispatch({
-          type: "ERROR",
-          message:
-            error instanceof Error ? error.message : "Failed to rotate audio segment.",
-        });
-      }
-    }, SEGMENT_DURATION_MS);
-  }, []);
-
   const startTicker = useCallback(() => {
     if (tickerRef.current !== null) {
       window.clearInterval(tickerRef.current);
@@ -322,25 +300,20 @@ export default function AudioCapture() {
     }, 1000);
   }, []);
 
-  const startSegmentRecorder = useCallback(
-    async (stream: MediaStream, mimeType: string) => {
-      currentSegmentChunksRef.current = [];
+  const startSegmentRecorder = useCallback(async (stream: MediaStream, mimeType: string) => {
+    currentSegmentChunksRef.current = [];
 
-      const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+    const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
 
-      mr.ondataavailable = (e: BlobEvent) => {
-        if (e.data.size > 0) {
-          currentSegmentChunksRef.current.push(e.data);
-        }
-      };
+    mr.ondataavailable = (e: BlobEvent) => {
+      if (e.data.size > 0) {
+        currentSegmentChunksRef.current.push(e.data);
+      }
+    };
 
-      activeRecorderRef.current = mr;
-      mr.start();
-    },
-    []
-  );
-
-  const pendingUploadsRef = useRef<Promise<void>[]>([]);
+    activeRecorderRef.current = mr;
+    mr.start();
+  }, []);
 
   const stopCurrentSegmentAndContinue = useCallback(
     async (finalSegment: boolean) => {
@@ -383,30 +356,53 @@ export default function AudioCapture() {
         }
       });
 
-    currentSegmentChunksRef.current = [];
-    activeRecorderRef.current = null;
+      currentSegmentChunksRef.current = [];
+      activeRecorderRef.current = null;
 
-    // IMPORTANT: restart capture immediately before upload
-    if (!finalSegment && activeStreamRef.current && !pausedRef.current && !stoppingRef.current) {
-      await startSegmentRecorder(activeStreamRef.current, mimeType);
-    }
+      if (!finalSegment && activeStreamRef.current && !pausedRef.current && !stoppingRef.current) {
+        await startSegmentRecorder(activeStreamRef.current, mimeType);
+      }
 
-    if (blob.size > 0) {
-      const uploadPromise = uploadSegment(sessionId, blob, currentIndex)
-        .then(() => {
-          console.log(`Uploaded segment ${currentIndex}`);
-        })
-        .catch((error) => {
-          console.error(`Failed to upload segment ${currentIndex}`, error);
-          throw error;
+      if (blob.size > 0) {
+        const uploadPromise = uploadSegment(sessionId, blob, currentIndex)
+          .then(() => {
+            console.log(`Uploaded segment ${currentIndex}`);
+          })
+          .catch((error) => {
+            console.error(`Failed to upload segment ${currentIndex}`, error);
+            throw error;
+          });
+
+        pendingUploadsRef.current.push(uploadPromise);
+        segmentIndexRef.current += 1;
+      }
+    },
+    [startSegmentRecorder, uploadSegment]
+  );
+
+  const scheduleSegmentRotation = useCallback(() => {
+    if (pausedRef.current || stoppingRef.current) return;
+
+    segmentTimerRef.current = window.setTimeout(async () => {
+      const sessionId = sessionIdRef.current;
+      if (!sessionId || pausedRef.current || stoppingRef.current) return;
+
+      try {
+        dispatch({ type: "UPLOADING_SEGMENT" });
+        await stopCurrentSegmentAndContinue(false);
+        if (!pausedRef.current && !stoppingRef.current) {
+          dispatch({ type: "START" });
+          scheduleSegmentRotation();
+        }
+      } catch (error) {
+        dispatch({
+          type: "ERROR",
+          message:
+            error instanceof Error ? error.message : "Failed to rotate audio segment.",
         });
-
-      pendingUploadsRef.current.push(uploadPromise);
-      segmentIndexRef.current += 1;
-    }
-  },
-  [startSegmentRecorder, uploadSegment]
-);
+      }
+    }, SEGMENT_DURATION_MS);
+  }, [stopCurrentSegmentAndContinue]);
 
   const handleStart = useCallback(async () => {
     try {
@@ -415,6 +411,7 @@ export default function AudioCapture() {
       pausedRef.current = false;
       segmentIndexRef.current = 0;
       currentSegmentChunksRef.current = [];
+      pendingUploadsRef.current = [];
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       activeStreamRef.current = stream;
@@ -486,7 +483,14 @@ export default function AudioCapture() {
         });
       }
     }
-  }, [clearTimers, scheduleSegmentRotation, startSegmentRecorder, startTicker, status, stopAndUploadCurrentSegment]);
+  }, [
+    clearTimers,
+    scheduleSegmentRotation,
+    startSegmentRecorder,
+    startTicker,
+    status,
+    stopCurrentSegmentAndContinue,
+  ]);
 
   const handleStop = useCallback(async () => {
     try {
@@ -503,14 +507,25 @@ export default function AudioCapture() {
         await stopCurrentSegmentAndContinue(true);
       }
 
-      await Promise.allSettled(pendingUploadsRef.current);
+      const uploadResults = await Promise.allSettled(pendingUploadsRef.current);
       pendingUploadsRef.current = [];
+
+      const failedUploads = uploadResults.filter((r) => r.status === "rejected");
+      if (failedUploads.length > 0) {
+        throw new Error(`${failedUploads.length} segment upload(s) failed before finalization.`);
+      }
 
       dispatch({ type: "FINALIZING" });
       await finalizeSession(sessionId);
 
       dispatch({ type: "PROCESS" });
       const note = await pollForResult(sessionId);
+      console.log("FINAL SOAP RESULT:", note);
+
+      if (!note || typeof note !== "object" || !("soap_note" in note)) {
+        throw new Error("Backend returned an invalid SOAP note shape.");
+      }
+
       setNoteData(note);
       teardownStream();
     } catch (error) {
@@ -520,7 +535,14 @@ export default function AudioCapture() {
         message: error instanceof Error ? error.message : "Failed to stop session.",
       });
     }
-  }, [clearTimers, finalizeSession, pollForResult, status, stopAndUploadCurrentSegment, teardownStream]);
+  }, [
+    clearTimers,
+    finalizeSession,
+    pollForResult,
+    status,
+    stopCurrentSegmentAndContinue,
+    teardownStream,
+  ]);
 
   const handleReset = useCallback(() => {
     teardownStream();
@@ -536,7 +558,6 @@ export default function AudioCapture() {
     return <NoteEditor data={noteData} onNewSession={handleReset} />;
   }
 
-  const isActive = status === "recording" || status === "paused";
   const isRecording = status === "recording";
   const isBusy =
     status === "starting" ||
@@ -550,18 +571,18 @@ export default function AudioCapture() {
     status === "starting"
       ? "Starting"
       : status === "recording"
-      ? "Recording"
-      : status === "paused"
-      ? "Paused"
-      : status === "uploading_segment"
-      ? "Uploading segment"
-      : status === "finalizing"
-      ? "Finalizing session"
-      : status === "processing"
-      ? "Generating note"
-      : status === "error"
-      ? "Error"
-      : "Ready";
+        ? "Recording"
+        : status === "paused"
+          ? "Paused"
+          : status === "uploading_segment"
+            ? "Uploading segment"
+            : status === "finalizing"
+              ? "Finalizing session"
+              : status === "processing"
+                ? "Generating note"
+                : status === "error"
+                  ? "Error"
+                  : "Ready";
 
   return (
     <>
@@ -586,19 +607,12 @@ export default function AudioCapture() {
 
       <div className="audio-capture-root min-h-screen bg-[#f7f7f5] text-[#202321] flex items-center justify-center px-4">
         <div className="w-full max-w-2xl bg-white rounded-[28px] border border-[#e8e8e5] shadow-[0_8px_30px_rgba(0,0,0,0.04)] overflow-hidden">
-          <div className="px-8 pt-8 pb-6 border-b border-[#ecece8] text-center">
-            <img
-              src="/metromind-logo.png"
-              alt="Metro Mind"
-              className="h-20 w-auto mx-auto mb-4"
-            />
-
+          <div className="px-8 pt-8 pb-6 border-b border-[#ecece8]">
             <div className="text-[12px] tracking-[0.22em] font-[700] text-[#2b9da0] uppercase">
               Metro Mind • Clinical
             </div>
-
             <h1 className="mt-2 text-[28px] leading-[1.1] font-[500] text-[#2c3433]">
-               Ambient AI Scribe
+              Ambient AI Scribe
             </h1>
           </div>
 
