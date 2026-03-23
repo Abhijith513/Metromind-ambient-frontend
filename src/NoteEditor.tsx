@@ -323,14 +323,85 @@ function toEhrText(note: SoapNote["soap_note"], verified: boolean, docName: stri
   return lines.filter((l) => l !== "").join("\n");
 }
 
-function deepClone<T>(v: T): T { return JSON.parse(JSON.stringify(v)); }
+function deepClone<T>(v: T): T {
+  if (v === undefined || v === null) {
+    return v as T;
+  }
+  return JSON.parse(JSON.stringify(v));
+}
 
 // ─── NoteEditor Component ─────────────────────────────────────────────────────
+const EMPTY_SOAP_NOTE: SoapNote["soap_note"] = {
+  subjective: {
+    hpi: {
+      chief_complaint: "",
+      onset: "",
+      duration: "",
+      precipitating_factors: [],
+      symptoms: [],
+      psychiatric_history: "",
+      substance_use: "",
+      social_history: "",
+      family_psychiatric_history: "",
+      medications: [],
+      allergies: [],
+    },
+  },
+  objective: {
+    mental_status_exam: {
+      appearance: "",
+      behavior: "",
+      speech: "",
+      mood: "",
+      affect: "",
+      thought_process: "",
+      thought_content: "",
+      perceptual_disturbances: "",
+      cognition: "",
+      insight: "",
+      judgment: "",
+    },
+  },
+  assessment: {
+    diagnoses: [],
+    risk_assessment: {
+      suicidal_ideation: {
+        present: "",
+        plan: "",
+        intent: "",
+        protective_factors: [],
+      },
+      homicidal_ideation: {
+        present: "",
+        detail: "",
+      },
+      self_harm: {
+        present: "",
+        detail: "",
+      },
+      overall_risk_level: null,
+      clinical_rationale: "",
+    },
+    psychometric_analysis: [],
+  },
+  plan: {
+    medications: [],
+    psychotherapy: "",
+    safety_plan: "",
+    referrals: [],
+    labs_or_diagnostics: [],
+    patient_education: "",
+    follow_up: "",
+    disposition: "",
+  },
+};
 
 export default function NoteEditor({ data, onNewSession }: NoteEditorProps) {
   const { currentUser } = useAuth(); // Pulls the logged-in doctor's data
 
-  const [note, setNote] = useState<SoapNote["soap_note"]>(() => deepClone(data.soap_note));
+  const [note, setNote] = useState<SoapNote["soap_note"]>(() =>
+  deepClone(data?.soap_note ?? EMPTY_SOAP_NOTE)
+);
   const [copied, setCopied] = useState(false);
   const copiedTimer = useRef<ReturnType<typeof setTimeout>>();
 
