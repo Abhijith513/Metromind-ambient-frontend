@@ -1,508 +1,657 @@
-/**
- * AudioCapture.tsx  (updated)
- *
- * When the backend returns the SOAP note JSON, stores it in state and
- * unmounts the recorder UI, mounting <NoteEditor> instead.
- *
- * Only the state management and submitAudio() handler changed from v1.
- * Everything else (MediaRecorder, waveform, UI) is identical.
- */
-
-import {
-  useCallback,
-  useEffect,
-  useReducer,
-  useRef,
-  useState,
-} from "react";
+import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import NoteEditor, { type SoapNote } from "./NoteEditor";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-type RecorderStatus = "idle" | "recording" | "paused" | "processing" | "error";
+type RecorderStatus =
+  | "idle"
+  | "starting"
+  | "recording"
+  | "paused"
+  | "uploading_segment"
+  | "finalizing"
+  | "processing"
+  | "error";
 
 interface State {
-  status: RecorderStatus;
-  elapsedSeconds: number;
-  errorMessage: string | null;
+  status: RecorderStatus;
+  elapsedSeconds: number;
+  errorMessage: string | null;
 }
 
 type Action =
-  | { type: "START" }
-  | { type: "PAUSE" }
-  | { type: "RESUME" }
-  | { type: "TICK" }
-  | { type: "PROCESS" }
-  | { type: "ERROR"; message: string }
-  | { type: "RESET" };
-
-// ─── Reducer ──────────────────────────────────────────────────────────────────
+  | { type: "STARTING" }
+  | { type: "START" }
+  | { type: "PAUSE" }
+  | { type: "RESUME" }
+  | { type: "TICK" }
+  | { type: "UPLOADING_SEGMENT" }
+  | { type: "FINALIZING" }
+  | { type: "PROCESS" }
+  | { type: "ERROR"; message: string }
+  | { type: "RESET" };
 
 const initialState: State = {
-  status: "idle",
-  elapsedSeconds: 0,
-  errorMessage: null,
+  status: "idle",
+  elapsedSeconds: 0,
+  errorMessage: null,
 };
 
 function reducer(state: State, action: Action): State {
-  switch (action.type) {
-    case "START":   return { ...initialState, status: "recording" };
-    case "PAUSE":   return { ...state, status: "paused" };
-    case "RESUME":  return { ...state, status: "recording" };
-    case "TICK":    return { ...state, elapsedSeconds: state.elapsedSeconds + 1 };
-    case "PROCESS": return { ...state, status: "processing" };
-    case "ERROR":   return { ...state, status: "error", errorMessage: action.message };
-    case "RESET":   return initialState;
-    default:        return state;
-  }
+  switch (action.type) {
+    case "STARTING":
+      return { ...initialState, status: "starting" };
+    case "START":
+      return { ...state, status: "recording", errorMessage: null };
+    case "PAUSE":
+      return { ...state, status: "paused" };
+    case "RESUME":
+      return { ...state, status: "recording" };
+    case "TICK":
+      return { ...state, elapsedSeconds: state.elapsedSeconds + 1 };
+    case "UPLOADING_SEGMENT":
+      return { ...state, status: "uploading_segment" };
+    case "FINALIZING":
+      return { ...state, status: "finalizing" };
+    case "PROCESS":
+      return { ...state, status: "processing" };
+    case "ERROR":
+      return { ...state, status: "error", errorMessage: action.message };
+    case "RESET":
+      return initialState;
+    default:
+      return state;
+  }
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
 function formatTime(totalSeconds: number): string {
-  const h = Math.floor(totalSeconds / 3600);
-  const m = Math.floor((totalSeconds % 3600) / 60);
-  const s = totalSeconds % 60;
-  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const s = totalSeconds % 60;
+
+  if (h > 0) {
+    return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  }
+
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
 function getBestMimeType(): string {
-  const candidates = [
-    "audio/webm;codecs=opus",
-    "audio/webm",
-    "audio/ogg;codecs=opus",
-    "audio/mp4",
-  ];
-  return candidates.find((m) => MediaRecorder.isTypeSupported(m)) ?? "";
-}
+  const candidates = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/ogg;codecs=opus",
+    "audio/mp4",
+  ];
 
-// ─── Loading Dots ─────────────────────────────────────────────────────────────
+  return candidates.find((m) => MediaRecorder.isTypeSupported(m)) ?? "";
+}
 
 function LoadingDots() {
-  return (
-    <span className="inline-flex items-end gap-[3px] ml-1 mb-[1px]">
-      {[0, 1, 2].map((i) => (
-        <span
-          key={i}
-          className="block w-[3px] h-[3px] rounded-full bg-current animate-bounce"
-          style={{ animationDelay: `${i * 0.15}s`, animationDuration: "0.9s" }}
-        />
-      ))}
-    </span>
-  );
+  return (
+    <span className="inline-flex items-end gap-[3px] ml-1 mb-[1px]">
+      {[0, 1, 2].map((i) => (
+        <span
+          key={i}
+          className="block w-[3px] h-[3px] rounded-full bg-current animate-bounce"
+          style={{ animationDelay: `${i * 0.15}s`, animationDuration: "0.9s" }}
+        />
+      ))}
+    </span>
+  );
 }
 
-// ─── Waveform ─────────────────────────────────────────────────────────────────
+function Waveform({
+  analyser,
+  active,
+}: {
+  analyser: AnalyserNode | null;
+  active: boolean;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const rafRef = useRef<number | null>(null);
 
-function Waveform({ analyser, active }: { analyser: AnalyserNode | null; active: boolean }) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const rafRef    = useRef<number>(0);
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
 
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d")!;
-    const W = canvas.width;
-    const H = canvas.height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
 
-    if (!active || !analyser) {
-      ctx.clearRect(0, 0, W, H);
-      ctx.strokeStyle = "rgba(180,180,175,0.35)";
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      ctx.moveTo(0, H / 2);
-      ctx.lineTo(W, H / 2);
-      ctx.stroke();
-      return;
-    }
+    const W = canvas.width;
+    const H = canvas.height;
 
-    const bufferLength = analyser.frequencyBinCount;
-    const dataArray    = new Uint8Array(bufferLength);
+    if (!active || !analyser) {
+      ctx.clearRect(0, 0, W, H);
+      ctx.strokeStyle = "rgba(180,180,175,0.35)";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(0, H / 2);
+      ctx.lineTo(W, H / 2);
+      ctx.stroke();
+      return;
+    }
 
-    function draw() {
-      rafRef.current = requestAnimationFrame(draw);
-      analyser!.getByteTimeDomainData(dataArray);
-      ctx.clearRect(0, 0, W, H);
-      ctx.strokeStyle = "rgba(220, 38, 38, 0.75)";
-      ctx.lineWidth = 1.5;
-      ctx.lineJoin = "round";
-      ctx.beginPath();
-      const sliceWidth = W / bufferLength;
-      let x = 0;
-      for (let i = 0; i < bufferLength; i++) {
-        const v = dataArray[i] / 128.0;
-        const y = (v * H) / 2;
-        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-        x += sliceWidth;
-      }
-      ctx.lineTo(W, H / 2);
-      ctx.stroke();
-    }
+    const bufferLength = analyser.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
 
-    draw();
-    return () => cancelAnimationFrame(rafRef.current);
-  }, [analyser, active]);
+    function draw() {
+      rafRef.current = requestAnimationFrame(draw);
+      analyser.getByteTimeDomainData(dataArray);
+      ctx.clearRect(0, 0, W, H);
+      ctx.strokeStyle = "rgba(220, 38, 38, 0.75)";
+      ctx.lineWidth = 1.5;
+      ctx.lineJoin = "round";
+      ctx.beginPath();
 
-  return <canvas ref={canvasRef} width={480} height={52} className="w-full h-full" />;
+      const sliceWidth = W / bufferLength;
+      let x = 0;
+
+      for (let i = 0; i < bufferLength; i += 1) {
+        const v = dataArray[i] / 128.0;
+        const y = (v * H) / 2;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+        x += sliceWidth;
+      }
+
+      ctx.lineTo(W, H / 2);
+      ctx.stroke();
+    }
+
+    draw();
+
+    return () => {
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+    };
+  }, [analyser, active]);
+
+  return <canvas ref={canvasRef} width={480} height={52} className="w-full h-full" />;
 }
 
-// ─── AudioCapture ─────────────────────────────────────────────────────────────
+const BACKEND_BASE =
+  import.meta.env.VITE_BACKEND_BASE_URL?.replace(/\/+$/, "") ||
+  "https://metromind-ambient-api.onrender.com/api";
 
-const BACKEND_URL = "https://metromind-ambient-api.onrender.com/api/transcribe";
+const SEGMENT_DURATION_MS = 30000;
 
 export default function AudioCapture() {
-  const [state, dispatch] = useReducer(reducer, initialState);
-  const { status, elapsedSeconds, errorMessage } = state;
+  const [state, dispatch] = useReducer(reducer, initialState);
+  const { status, elapsedSeconds, errorMessage } = state;
 
-  // ── NEW: stores the returned SOAP note; non-null swaps to NoteEditor ──────
-  const [noteData, setNoteData] = useState<SoapNote | null>(null);
+  const [noteData, setNoteData] = useState<SoapNote | null>(null);
+  const [analyser, setAnalyser] = useState<AnalyserNode | null>(null);
 
-  // MediaRecorder refs
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef        = useRef<Blob[]>([]);
-  const streamRef        = useRef<MediaStream | null>(null);
-  const tickerRef        = useRef<ReturnType<typeof setInterval>>();
+  const sessionIdRef = useRef<string | null>(null);
+  const activeRecorderRef = useRef<MediaRecorder | null>(null);
+  const activeStreamRef = useRef<MediaStream | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const tickerRef = useRef<number | null>(null);
+  const segmentTimerRef = useRef<number | null>(null);
+  const currentSegmentChunksRef = useRef<Blob[]>([]);
+  const segmentIndexRef = useRef<number>(0);
+  const stoppingRef = useRef<boolean>(false);
+  const pausedRef = useRef<boolean>(false);
+  const currentMimeTypeRef = useRef<string>("audio/webm");
 
-  // Web Audio
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const [analyser, setAnalyser] = useState<AnalyserNode | null>(null);
+  const clearTimers = useCallback(() => {
+    if (tickerRef.current !== null) {
+      window.clearInterval(tickerRef.current);
+      tickerRef.current = null;
+    }
+    if (segmentTimerRef.current !== null) {
+      window.clearTimeout(segmentTimerRef.current);
+      segmentTimerRef.current = null;
+    }
+  }, []);
 
-  // ── Cleanup ───────────────────────────────────────────────────────────────
+  const teardownStream = useCallback(() => {
+    clearTimers();
+    activeStreamRef.current?.getTracks().forEach((t) => t.stop());
+    activeStreamRef.current = null;
+    activeRecorderRef.current = null;
+    currentSegmentChunksRef.current = [];
+    audioCtxRef.current?.close().catch(() => {});
+    audioCtxRef.current = null;
+    setAnalyser(null);
+  }, [clearTimers]);
 
-  const teardownStream = useCallback(() => {
-    if (tickerRef.current) clearInterval(tickerRef.current);
-    streamRef.current?.getTracks().forEach((t) => t.stop());
-    audioCtxRef.current?.close();
-    streamRef.current  = null;
-    audioCtxRef.current = null;
-    setAnalyser(null);
-  }, []);
+  useEffect(() => {
+    return () => teardownStream();
+  }, [teardownStream]);
 
-  useEffect(() => () => teardownStream(), [teardownStream]);
+  const createSession = useCallback(async (): Promise<string> => {
+    const res = await fetch(`${BACKEND_BASE}/sessions`, {
+      method: "POST",
+    });
 
-  // ── POST to backend ───────────────────────────────────────────────────────
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body?.error ?? "Failed to create session.");
+    }
 
-  const submitAudio = useCallback(async (blob: Blob) => {
-    dispatch({ type: "PROCESS" });
-    try {
-      const form = new FormData();
-      const ext  = blob.type.includes("ogg") ? "ogg" : blob.type.includes("mp4") ? "mp4" : "webm";
-      form.append("audio", blob, `session.${ext}`);
+    const json = (await res.json()) as { sessionId: string };
+    return json.sessionId;
+  }, []);
 
-      const res = await fetch(BACKEND_URL, { method: "POST", body: form });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({ error: res.statusText }));
-        throw new Error(body?.error ?? `HTTP ${res.status}`);
-      }
+  const uploadSegment = useCallback(
+    async (sessionId: string, blob: Blob, segmentIndex: number) => {
+      const form = new FormData();
+      const ext = blob.type.includes("ogg")
+        ? "ogg"
+        : blob.type.includes("mp4")
+        ? "mp4"
+        : "webm";
 
-      const json: SoapNote = await res.json();
-      console.log("✅ Psychiatric SOAP Note JSON:", json);
+      form.append("audio", blob, `segment-${segmentIndex}.${ext}`);
+      form.append("segmentIndex", String(segmentIndex));
 
-      // Transition: recorder screen → note editor
-      setNoteData(json);
-    } catch (err) {
-      dispatch({
-        type: "ERROR",
-        message: err instanceof Error ? err.message : "Unknown error",
-      });
-    }
-  }, []);
+      const res = await fetch(`${BACKEND_BASE}/sessions/${sessionId}/segments`, {
+        method: "POST",
+        body: form,
+      });
 
-  // ── Start ─────────────────────────────────────────────────────────────────
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body?.error ?? "Failed to upload segment.");
+      }
+    },
+    []
+  );
 
-  const handleStart = useCallback(async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current  = stream;
-      chunksRef.current  = [];
+  const finalizeSession = useCallback(async (sessionId: string) => {
+    const res = await fetch(`${BACKEND_BASE}/sessions/${sessionId}/finalize`, {
+      method: "POST",
+    });
 
-      const audioCtx = new AudioContext();
-      const source   = audioCtx.createMediaStreamSource(stream);
-      const an       = audioCtx.createAnalyser();
-      an.fftSize = 2048;
-      source.connect(an);
-      audioCtxRef.current = audioCtx;
-      setAnalyser(an);
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body?.error ?? "Failed to finalize session.");
+    }
+  }, []);
 
-      const mimeType = getBestMimeType();
-      const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-      mr.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
-      mr.start(250);
-      mediaRecorderRef.current = mr;
+  const pollForResult = useCallback(async (sessionId: string): Promise<SoapNote> => {
+    for (;;) {
+      const res = await fetch(`${BACKEND_BASE}/sessions/${sessionId}/result`);
 
-      dispatch({ type: "START" });
-      tickerRef.current = setInterval(() => dispatch({ type: "TICK" }), 1000);
-    } catch {
-      dispatch({ type: "ERROR", message: "Microphone access denied. Please allow microphone permissions." });
-    }
-  }, []);
+      if (res.status === 409) {
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+        continue;
+      }
 
-  // ── Pause / Resume ────────────────────────────────────────────────────────
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body?.error ?? "Failed to fetch result.");
+      }
 
-  const handlePauseResume = useCallback(() => {
-    const mr = mediaRecorderRef.current;
-    if (!mr) return;
-    if (status === "recording") {
-      mr.pause();
-      if (tickerRef.current) clearInterval(tickerRef.current);
-      dispatch({ type: "PAUSE" });
-    } else if (status === "paused") {
-      mr.resume();
-      tickerRef.current = setInterval(() => dispatch({ type: "TICK" }), 1000);
-      dispatch({ type: "RESUME" });
-    }
-  }, [status]);
+      return (await res.json()) as SoapNote;
+    }
+  }, []);
 
-  // ── Stop & Process ────────────────────────────────────────────────────────
+  const scheduleSegmentRotation = useCallback(() => {
+    if (pausedRef.current || stoppingRef.current) return;
 
-  const handleStop = useCallback(() => {
-    const mr = mediaRecorderRef.current;
-    if (!mr) return;
-    if (tickerRef.current) clearInterval(tickerRef.current);
-    mr.onstop = () => {
-      const blob = new Blob(chunksRef.current, { type: mr.mimeType || "audio/webm" });
-      chunksRef.current = [];
-      teardownStream();
-      submitAudio(blob);
-    };
-    mr.stop();
-  }, [submitAudio, teardownStream]);
+    segmentTimerRef.current = window.setTimeout(async () => {
+      const sessionId = sessionIdRef.current;
+      if (!sessionId || pausedRef.current || stoppingRef.current) return;
 
-  // ── Reset (back to idle from error or new session from NoteEditor) ────────
+      try {
+        dispatch({ type: "UPLOADING_SEGMENT" });
+        await stopAndUploadCurrentSegment(false);
+        if (!pausedRef.current && !stoppingRef.current) {
+          dispatch({ type: "START" });
+          scheduleSegmentRotation();
+        }
+      } catch (error) {
+        dispatch({
+          type: "ERROR",
+          message:
+            error instanceof Error ? error.message : "Failed to rotate audio segment.",
+        });
+      }
+    }, SEGMENT_DURATION_MS);
+  }, []);
 
-  const handleReset = useCallback(() => {
-    teardownStream();
-    setNoteData(null);
-    dispatch({ type: "RESET" });
-  }, [teardownStream]);
+  const startTicker = useCallback(() => {
+    if (tickerRef.current !== null) {
+      window.clearInterval(tickerRef.current);
+    }
 
-  // ── Swap to NoteEditor once data arrives ──────────────────────────────────
+    tickerRef.current = window.setInterval(() => {
+      if (!pausedRef.current && !stoppingRef.current) {
+        dispatch({ type: "TICK" });
+      }
+    }, 1000);
+  }, []);
 
-  if (noteData) {
-    return <NoteEditor data={noteData} onNewSession={handleReset} />;
-  }
+  const startSegmentRecorder = useCallback(
+    async (stream: MediaStream, mimeType: string) => {
+      currentSegmentChunksRef.current = [];
 
-  // ── Derived booleans ──────────────────────────────────────────────────────
+      const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
 
-  const isActive     = status === "recording" || status === "paused";
-  const isRecording  = status === "recording";
-  const isProcessing = status === "processing";
-  const isError      = status === "error";
-  const isIdle       = status === "idle";
+      mr.ondataavailable = (e: BlobEvent) => {
+        if (e.data.size > 0) {
+          currentSegmentChunksRef.current.push(e.data);
+        }
+      };
 
-  // ── Render: recorder card ─────────────────────────────────────────────────
+      activeRecorderRef.current = mr;
+      mr.start();
+    },
+    []
+  );
 
-  return (
-    <>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;1,9..40,300&family=DM+Mono:wght@400;500&display=swap');
-        .audio-capture-root * { font-family: 'DM Sans', sans-serif; }
-        .mono { font-family: 'DM Mono', monospace; }
-        @keyframes pulse-ring {
-          0%   { transform: scale(1);   opacity: 0.6; }
-          70%  { transform: scale(1.9); opacity: 0;   }
-          100% { transform: scale(1);   opacity: 0;   }
-        }
-        .pulse-ring::before {
-          content: '';
-          position: absolute;
-          inset: 0;
-          border-radius: 9999px;
-          background: #dc2626;
-          animation: pulse-ring 1.4s ease-out infinite;
-        }
-        @keyframes fade-in-up {
-          from { opacity: 0; transform: translateY(8px); }
-          to   { opacity: 1; transform: translateY(0); }
-        }
-        .fade-in-up { animation: fade-in-up 0.35s ease both; }
-        @keyframes shimmer {
-          0%   { background-position: -200% center; }
-          100% { background-position:  200% center; }
-        }
-        .shimmer-text {
-          background: linear-gradient(90deg, #6b7280 30%, #111 50%, #6b7280 70%);
-          background-size: 200% auto;
-          -webkit-background-clip: text;
-          -webkit-text-fill-color: transparent;
-          background-clip: text;
-          animation: shimmer 2.2s linear infinite;
-        }
-      `}</style>
+  const stopAndUploadCurrentSegment = useCallback(
+    async (finalSegment: boolean) => {
+      const mr = activeRecorderRef.current;
+      const sessionId = sessionIdRef.current;
+      const mimeType = currentMimeTypeRef.current || "audio/webm";
 
-      <div className="audio-capture-root min-h-screen bg-[#f9f9f8] flex items-center justify-center p-6">
-        <div className="w-full max-w-md fade-in-up">
-          <div className="bg-white border border-[#e8e8e5] rounded-2xl shadow-[0_2px_24px_rgba(0,0,0,0.06)] overflow-hidden">
+      if (!mr || !sessionId) return;
 
-            {/* Header */}
-            <div className="px-7 pt-7 pb-5 border-b border-[#f0f0ed]">
-              <p className="text-[10px] font-bold tracking-[0.2em] text-[#179ea1] uppercase mb-1">
-                Metro Mind • Clinical
-              </p>
-              <h1 className="text-[1.35rem] font-[500] text-[#2c3d3a] leading-snug">
-                Ambient AI Scribe
-              </h1>
-            </div>
+      const currentIndex = segmentIndexRef.current;
 
-            {/* Body */}
-            <div className="px-7 py-6 space-y-6">
+      const blob = await new Promise<Blob>((resolve, reject) => {
+        const prevOnStop = mr.onstop;
+        const prevOnError = mr.onerror;
 
-              {/* Status row */}
-              <div className="flex items-center justify-between h-7">
-                <div className="flex items-center gap-2.5">
-                  {isRecording ? (
-                    <span className="relative flex items-center justify-center w-3 h-3 pulse-ring">
-                      <span className="relative block w-3 h-3 rounded-full bg-[#dc2626]" />
-                    </span>
-                  ) : (
-                    <span className={`block w-2.5 h-2.5 rounded-full transition-colors duration-300 ${
-                      status === "paused" ? "bg-amber-400"            :
-                      isError            ? "bg-red-500"               :
-                      isProcessing       ? "bg-blue-400 animate-pulse":
-                      "bg-[#d4d4cf]"
-                    }`} />
-                  )}
-                  <span className={`text-[13px] font-[450] tracking-wide ${
-                    isRecording         ? "text-[#dc2626]"  :
-                    status === "paused" ? "text-amber-600"  :
-                    isError             ? "text-red-600"    :
-                    isProcessing        ? "text-blue-600"   :
-                    "text-[#9b9b93]"
-                  }`}>
-                    {isRecording         && "Recording"}
-                    {status === "paused" && "Paused"}
-                    {isIdle              && "Ready"}
-                    {isProcessing        && "Processing"}
-                    {isError             && "Error"}
-                  </span>
-                </div>
-                <span className={`mono text-[1.2rem] font-[500] tabular-nums transition-colors duration-300 ${
-                  isRecording ? "text-[#111]" : isActive ? "text-[#555]" : "text-[#ccc]"
-                }`}>
-                  {formatTime(elapsedSeconds)}
-                </span>
-              </div>
+        mr.onstop = () => {
+          try {
+            const audioBlob = new Blob(currentSegmentChunksRef.current, {
+              type: mimeType,
+            });
+            resolve(audioBlob);
+          } catch (err) {
+            reject(err);
+          } finally {
+            mr.onstop = prevOnStop;
+            mr.onerror = prevOnError;
+          }
+        };
 
-              {/* Waveform */}
-              <div className={`rounded-xl h-14 overflow-hidden transition-all duration-500 ${
-                isActive
-                  ? "bg-[#fdf1f1] border border-[#fad0d0]"
-                  : "bg-[#f5f5f3] border border-[#ebebea]"
-              }`}>
-                <Waveform analyser={analyser} active={isRecording} />
-              </div>
+        mr.onerror = () => {
+          reject(new Error("Segment recorder failed while stopping."));
+          mr.onstop = prevOnStop;
+          mr.onerror = prevOnError;
+        };
 
-              {/* Processing banner */}
-              {isProcessing && (
-                <div className="fade-in-up rounded-xl bg-[#f5f7ff] border border-[#dde3ff] px-5 py-4">
-                  <p className="text-[13px] font-[500] text-[#3d4eac] flex items-center">
-                    <span className="shimmer-text">Analyzing clinical context</span>
-                    <LoadingDots />
-                  </p>
-                  <p className="text-[11.5px] text-[#8b93c9] mt-1 leading-relaxed">
-                    Generating structured SOAP note via Gemini. Long sessions may
-                    take a few minutes — please keep this window open.
-                  </p>
-                </div>
-              )}
+        try {
+          mr.stop();
+        } catch (err) {
+          reject(err);
+        }
+      });
 
-              {/* Error banner */}
-              {isError && (
-                <div className="fade-in-up rounded-xl bg-[#fff4f4] border border-[#fecaca] px-5 py-4">
-                  <p className="text-[13px] font-[500] text-[#b91c1c]">Something went wrong</p>
-                  <p className="text-[11.5px] text-[#d97b7b] mt-1 break-words">{errorMessage}</p>
-                </div>
-              )}
+      currentSegmentChunksRef.current = [];
+      activeRecorderRef.current = null;
 
-              {/* Controls */}
-              <div className="flex items-center gap-2.5 pt-1">
-                {isIdle && (
-                  <button
-                    onClick={handleStart}
-                    className="fade-in-up flex-1 flex items-center justify-center gap-2 bg-gradient-to-r from-[#179ea1] to-[#4bcba2] hover:from-[#14898c] hover:to-[#41af8c] shadow-md shadow-[#179ea1]/20 text-white text-[13px] font-[600] tracking-wide rounded-xl h-11 transition-all duration-150 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[#179ea1]"
-                  >
-                    <MicIcon /> Start Recording
-                  </button>
-                )}
-                {isActive && (
-                  <button
-                    onClick={handlePauseResume}
-                    className={`flex items-center justify-center gap-2 text-[13px] font-[500] tracking-wide rounded-xl h-11 w-36 transition-colors duration-150 focus:outline-none focus:ring-2 focus:ring-offset-2 border ${
-                      isRecording
-                        ? "border-[#e8e8e5] text-[#555] hover:bg-[#f5f5f3] focus:ring-[#aaa]"
-                        : "border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100 focus:ring-amber-300"
-                    }`}
-                  >
-                    {isRecording ? <><PauseIcon /> Pause</> : <><MicIcon /> Resume</>}
-                  </button>
-                )}
-                {isActive && (
-                  <button
-                    onClick={handleStop}
-                    className="flex-1 flex items-center justify-center gap-2 bg-[#dc2626] hover:bg-[#b91c1c] text-white text-[13px] font-[500] tracking-wide rounded-xl h-11 transition-colors duration-150 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-400"
-                  >
-                    <StopIcon /> Stop &amp; Process
-                  </button>
-                )}
-                {isError && (
-                  <button
-                    onClick={handleReset}
-                    className="fade-in-up flex-1 flex items-center justify-center gap-2 border border-[#e8e8e5] text-[#555] hover:bg-[#f5f5f3] text-[13px] font-[500] tracking-wide rounded-xl h-11 transition-colors duration-150 focus:outline-none"
-                  >
-                    Try Again
-                  </button>
-                )}
-              </div>
-            </div>
+      if (blob.size > 0) {
+        await uploadSegment(sessionId, blob, currentIndex);
+        segmentIndexRef.current += 1;
+      }
 
-            {/* Footer */}
-            <div className="px-7 pb-5">
-              <p className="text-[10.5px] text-[#bbb] leading-relaxed">
-                Audio is processed exclusively on your local backend and never stored
-                beyond the active request. For clinical use only — always review
-                AI-generated notes before filing.
-              </p>
-            </div>
-          </div>
+      if (!finalSegment && activeStreamRef.current && !pausedRef.current && !stoppingRef.current) {
+        await startSegmentRecorder(activeStreamRef.current, mimeType);
+      }
+    },
+    [startSegmentRecorder, uploadSegment]
+  );
 
-          {isActive && (
-            <p className="fade-in-up mono text-center text-[11px] text-[#b0b0a8] mt-4 tabular-nums">
-              Session in progress · {formatTime(elapsedSeconds)} elapsed
-            </p>
-          )}
-        </div>
-      </div>
-    </>
-  );
-}
+  const handleStart = useCallback(async () => {
+    try {
+      dispatch({ type: "STARTING" });
+      stoppingRef.current = false;
+      pausedRef.current = false;
+      segmentIndexRef.current = 0;
+      currentSegmentChunksRef.current = [];
 
-// ─── Icons ────────────────────────────────────────────────────────────────────
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      activeStreamRef.current = stream;
 
-function MicIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
-      <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-      <line x1="12" y1="19" x2="12" y2="23"/>
-      <line x1="8"  y1="23" x2="16" y2="23"/>
-    </svg>
-  );
-}
+      const audioCtx = new AudioContext();
+      const source = audioCtx.createMediaStreamSource(stream);
+      const an = audioCtx.createAnalyser();
+      an.fftSize = 2048;
+      source.connect(an);
+      audioCtxRef.current = audioCtx;
+      setAnalyser(an);
 
-function PauseIcon() {
-  return (
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
-      <rect x="6" y="4" width="4" height="16" rx="1"/>
-      <rect x="14" y="4" width="4" height="16" rx="1"/>
-    </svg>
-  );
-}
+      const sessionId = await createSession();
+      sessionIdRef.current = sessionId;
 
-function StopIcon() {
-  return (
-    <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
-      <rect x="4" y="4" width="16" height="16" rx="2"/>
-    </svg>
-  );
+      const mimeType = getBestMimeType();
+      currentMimeTypeRef.current = mimeType || "audio/webm";
+
+      await startSegmentRecorder(stream, currentMimeTypeRef.current);
+      dispatch({ type: "START" });
+      startTicker();
+      scheduleSegmentRotation();
+    } catch (error) {
+      teardownStream();
+      dispatch({
+        type: "ERROR",
+        message:
+          error instanceof Error
+            ? error.message
+            : "Microphone access denied or session failed to start.",
+      });
+    }
+  }, [createSession, scheduleSegmentRotation, startSegmentRecorder, startTicker, teardownStream]);
+
+  const handlePauseResume = useCallback(async () => {
+    if (status === "recording") {
+      pausedRef.current = true;
+      clearTimers();
+
+      try {
+        dispatch({ type: "UPLOADING_SEGMENT" });
+        await stopAndUploadCurrentSegment(true);
+        dispatch({ type: "PAUSE" });
+      } catch (error) {
+        dispatch({
+          type: "ERROR",
+          message: error instanceof Error ? error.message : "Failed to pause session.",
+        });
+      }
+
+      return;
+    }
+
+    if (status === "paused") {
+      try {
+        if (!activeStreamRef.current) {
+          throw new Error("Microphone stream is not available.");
+        }
+
+        pausedRef.current = false;
+        await startSegmentRecorder(activeStreamRef.current, currentMimeTypeRef.current);
+        dispatch({ type: "RESUME" });
+        startTicker();
+        scheduleSegmentRotation();
+      } catch (error) {
+        dispatch({
+          type: "ERROR",
+          message: error instanceof Error ? error.message : "Failed to resume session.",
+        });
+      }
+    }
+  }, [clearTimers, scheduleSegmentRotation, startSegmentRecorder, startTicker, status, stopAndUploadCurrentSegment]);
+
+  const handleStop = useCallback(async () => {
+    try {
+      stoppingRef.current = true;
+      clearTimers();
+
+      const sessionId = sessionIdRef.current;
+      if (!sessionId) {
+        throw new Error("Session not found.");
+      }
+
+      if (status === "recording" || status === "uploading_segment") {
+        dispatch({ type: "UPLOADING_SEGMENT" });
+        await stopAndUploadCurrentSegment(true);
+      }
+
+      dispatch({ type: "FINALIZING" });
+      await finalizeSession(sessionId);
+
+      dispatch({ type: "PROCESS" });
+      const note = await pollForResult(sessionId);
+      setNoteData(note);
+      teardownStream();
+    } catch (error) {
+      teardownStream();
+      dispatch({
+        type: "ERROR",
+        message: error instanceof Error ? error.message : "Failed to stop session.",
+      });
+    }
+  }, [clearTimers, finalizeSession, pollForResult, status, stopAndUploadCurrentSegment, teardownStream]);
+
+  const handleReset = useCallback(() => {
+    teardownStream();
+    sessionIdRef.current = null;
+    segmentIndexRef.current = 0;
+    stoppingRef.current = false;
+    pausedRef.current = false;
+    setNoteData(null);
+    dispatch({ type: "RESET" });
+  }, [teardownStream]);
+
+  if (noteData) {
+    return <NoteEditor data={noteData} onNewSession={handleReset} />;
+  }
+
+  const isActive = status === "recording" || status === "paused";
+  const isRecording = status === "recording";
+  const isBusy =
+    status === "starting" ||
+    status === "uploading_segment" ||
+    status === "finalizing" ||
+    status === "processing";
+  const isError = status === "error";
+  const isIdle = status === "idle";
+
+  const statusLabel =
+    status === "starting"
+      ? "Starting"
+      : status === "recording"
+      ? "Recording"
+      : status === "paused"
+      ? "Paused"
+      : status === "uploading_segment"
+      ? "Uploading segment"
+      : status === "finalizing"
+      ? "Finalizing session"
+      : status === "processing"
+      ? "Generating note"
+      : status === "error"
+      ? "Error"
+      : "Ready";
+
+  return (
+    <>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;1,9..40,300&family=DM+Mono:wght@400;500&display=swap');
+        .audio-capture-root * { font-family: 'DM Sans', sans-serif; }
+        .mono { font-family: 'DM Mono', monospace; }
+        @keyframes pulse-ring {
+          0%   { transform: scale(1);   opacity: 0.6; }
+          70%  { transform: scale(1.9); opacity: 0;   }
+          100% { transform: scale(1);   opacity: 0;   }
+        }
+        .pulse-ring::before {
+          content: '';
+          position: absolute;
+          inset: 0;
+          border-radius: 9999px;
+          background: #dc2626;
+          animation: pulse-ring 1.4s ease-out infinite;
+        }
+      `}</style>
+
+      <div className="audio-capture-root min-h-screen bg-[#f7f7f5] text-[#202321] flex items-center justify-center px-4">
+        <div className="w-full max-w-2xl bg-white rounded-[28px] border border-[#e8e8e5] shadow-[0_8px_30px_rgba(0,0,0,0.04)] overflow-hidden">
+          <div className="px-8 pt-8 pb-6 border-b border-[#ecece8]">
+            <div className="text-[12px] tracking-[0.22em] font-[700] text-[#2b9da0] uppercase">
+              Metro Mind • Clinical
+            </div>
+            <h1 className="mt-2 text-[28px] leading-[1.1] font-[500] text-[#2c3433]">
+              Ambient AI Scribe
+            </h1>
+          </div>
+
+          <div className="px-8 py-8">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="relative flex items-center justify-center w-4 h-4">
+                  {isRecording ? (
+                    <>
+                      <span className="pulse-ring absolute w-3 h-3 rounded-full" />
+                      <span className="relative w-3 h-3 rounded-full bg-red-600" />
+                    </>
+                  ) : (
+                    <span className={`w-3 h-3 rounded-full ${isError ? "bg-red-500" : "bg-[#c9cbc7]"}`} />
+                  )}
+                </div>
+
+                <div className={`text-[15px] font-[500] ${isError ? "text-red-700" : "text-[#2f3837]"}`}>
+                  {statusLabel}
+                  {isBusy && !isError ? <LoadingDots /> : null}
+                </div>
+              </div>
+
+              <div className="mono text-[18px] tracking-[0.04em] text-[#b8bbb7]">
+                {formatTime(elapsedSeconds)}
+              </div>
+            </div>
+
+            <div className="mt-8 h-[72px] rounded-[20px] border border-[#ecece8] bg-[#fcfcfb] px-4 flex items-center">
+              <Waveform analyser={analyser} active={isRecording} />
+            </div>
+
+            {isError && (
+              <div className="mt-8 rounded-[20px] border border-red-200 bg-red-50 px-6 py-5">
+                <div className="text-[16px] font-[600] text-red-800">Something went wrong</div>
+                <div className="mt-2 text-[15px] leading-7 text-red-700">{errorMessage}</div>
+              </div>
+            )}
+
+            <div className="mt-8 flex flex-col sm:flex-row gap-4">
+              {isIdle || isError ? (
+                <button
+                  onClick={isError ? handleReset : handleStart}
+                  className="flex-1 rounded-[18px] border border-[#dfdfda] bg-white px-6 py-4 text-[18px] font-[500] text-[#3a413f] hover:bg-[#fafaf8] transition"
+                >
+                  {isError ? "Try Again" : "Start Session"}
+                </button>
+              ) : (
+                <>
+                  <button
+                    onClick={handlePauseResume}
+                    disabled={isBusy}
+                    className="flex-1 rounded-[18px] border border-[#dfdfda] bg-white px-6 py-4 text-[18px] font-[500] text-[#3a413f] hover:bg-[#fafaf8] transition disabled:opacity-50"
+                  >
+                    {status === "paused" ? "Resume" : "Pause"}
+                  </button>
+
+                  <button
+                    onClick={handleStop}
+                    disabled={isBusy && status !== "recording"}
+                    className="flex-1 rounded-[18px] border border-transparent bg-[#2f3837] px-6 py-4 text-[18px] font-[500] text-white hover:opacity-95 transition disabled:opacity-50"
+                  >
+                    Stop & Generate Note
+                  </button>
+                </>
+              )}
+            </div>
+
+            <div className="mt-8 text-[13px] leading-7 text-[#a5a8a3]">
+              Audio is uploaded in rolling segments during the live consultation and then assembled
+              into a final AI-generated draft for clinician review.
+            </div>
+          </div>
+        </div>
+      </div>
+    </>
+  );
 }
