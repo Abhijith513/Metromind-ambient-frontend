@@ -1,11 +1,9 @@
 /**
- * AudioCapture.tsx  (updated)
+ * AudioCapture.tsx  (Asynchronous Polling + Wake Lock Update)
  *
- * When the backend returns the SOAP note JSON, stores it in state and
- * unmounts the recorder UI, mounting <NoteEditor> instead.
- *
- * Only the state management and submitAudio() handler changed from v1.
- * Everything else (MediaRecorder, waveform, UI) is identical.
+ * Implements a "drop-off and pickup" polling architecture to bypass 
+ * mobile browser timeout limits for long clinical recordings.
+ * Uses the Screen Wake Lock API to prevent mobile devices from sleeping.
  */
 
 import {
@@ -149,31 +147,59 @@ function Waveform({ analyser, active }: { analyser: AnalyserNode | null; active:
 
 // ─── AudioCapture ─────────────────────────────────────────────────────────────
 
-const BACKEND_URL = "https://metromind-ambient-api.onrender.com/api/transcribe";
+const API_BASE_URL = "https://metromind-ambient-api.onrender.com/api";
 
 export default function AudioCapture() {
   const [state, dispatch] = useReducer(reducer, initialState);
   const { status, elapsedSeconds, errorMessage } = state;
 
-  // ── NEW: stores the returned SOAP note; non-null swaps to NoteEditor ──────
   const [noteData, setNoteData] = useState<SoapNote | null>(null);
 
-  // MediaRecorder refs
+  // Refs
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef        = useRef<Blob[]>([]);
   const streamRef        = useRef<MediaStream | null>(null);
   const tickerRef        = useRef<ReturnType<typeof setInterval>>();
+  const pollIntervalRef  = useRef<ReturnType<typeof setInterval> | null>(null);
+  const wakeLockRef      = useRef<any>(null);
 
   // Web Audio
   const audioCtxRef = useRef<AudioContext | null>(null);
   const [analyser, setAnalyser] = useState<AnalyserNode | null>(null);
 
+  // ── Wake Lock Management ────────────────────────────────────────────────────
+  
+  const requestWakeLock = async () => {
+    try {
+      if ('wakeLock' in navigator) {
+        wakeLockRef.current = await (navigator as any).wakeLock.request('screen');
+        console.log("Screen Wake Lock active.");
+      }
+    } catch (err) {
+      console.warn("Wake Lock denied or not supported.", err);
+    }
+  };
+
+  const releaseWakeLock = async () => {
+    if (wakeLockRef.current) {
+      try {
+        await wakeLockRef.current.release();
+        wakeLockRef.current = null;
+        console.log("Screen Wake Lock released.");
+      } catch (err) {
+        console.error(err);
+      }
+    }
+  };
+
   // ── Cleanup ───────────────────────────────────────────────────────────────
 
   const teardownStream = useCallback(() => {
     if (tickerRef.current) clearInterval(tickerRef.current);
+    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
     streamRef.current?.getTracks().forEach((t) => t.stop());
     audioCtxRef.current?.close();
+    releaseWakeLock();
     streamRef.current  = null;
     audioCtxRef.current = null;
     setAnalyser(null);
@@ -181,7 +207,7 @@ export default function AudioCapture() {
 
   useEffect(() => () => teardownStream(), [teardownStream]);
 
-  // ── POST to backend ───────────────────────────────────────────────────────
+  // ── ASYNC: POST & Poll ────────────────────────────────────────────────────
 
   const submitAudio = useCallback(async (blob: Blob) => {
     dispatch({ type: "PROCESS" });
@@ -190,17 +216,42 @@ export default function AudioCapture() {
       const ext  = blob.type.includes("ogg") ? "ogg" : blob.type.includes("mp4") ? "mp4" : "webm";
       form.append("audio", blob, `session.${ext}`);
 
-      const res = await fetch(BACKEND_URL, { method: "POST", body: form });
+      // 1. The Drop-off (Get Ticket)
+      const res = await fetch(`${API_BASE_URL}/transcribe`, { method: "POST", body: form });
       if (!res.ok) {
         const body = await res.json().catch(() => ({ error: res.statusText }));
         throw new Error(body?.error ?? `HTTP ${res.status}`);
       }
 
-      const json: SoapNote = await res.json();
-      console.log("✅ Psychiatric SOAP Note JSON:", json);
+      const { jobId } = await res.json();
+      if (!jobId) throw new Error("No Job ID returned from server.");
+      
+      console.log(`Audio dropped off successfully. Polling Job: ${jobId}`);
 
-      // Transition: recorder screen → note editor
-      setNoteData(json);
+      // 2. The Pickup (Poll every 5 seconds)
+      pollIntervalRef.current = setInterval(async () => {
+        try {
+          const statusRes = await fetch(`${API_BASE_URL}/job/${jobId}`);
+          if (!statusRes.ok) throw new Error("Failed to check job status");
+
+          const jobData = await statusRes.json();
+
+          if (jobData.status === "completed") {
+            if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+            console.log("✅ Psychiatric SOAP Note JSON:", jobData.result);
+            setNoteData(jobData.result);
+          } else if (jobData.status === "failed") {
+            if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+            dispatch({ type: "ERROR", message: jobData.error || "AI processing failed. Please try again." });
+          }
+          // If status is "processing", we just wait for the next 5-second tick...
+        } catch (err) {
+          console.error("Polling error:", err);
+          if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+          dispatch({ type: "ERROR", message: err instanceof Error ? err.message : "Polling failed." });
+        }
+      }, 5000);
+
     } catch (err) {
       dispatch({
         type: "ERROR",
@@ -216,6 +267,8 @@ export default function AudioCapture() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current  = stream;
       chunksRef.current  = [];
+
+      await requestWakeLock(); // Prevent mobile screen from turning off
 
       const audioCtx = new AudioContext();
       const source   = audioCtx.createMediaStreamSource(stream);
@@ -269,7 +322,7 @@ export default function AudioCapture() {
     mr.stop();
   }, [submitAudio, teardownStream]);
 
-  // ── Reset (back to idle from error or new session from NoteEditor) ────────
+  // ── Reset ─────────────────────────────────────────────────────────────────
 
   const handleReset = useCallback(() => {
     teardownStream();
@@ -358,7 +411,7 @@ export default function AudioCapture() {
                   ) : (
                     <span className={`block w-2.5 h-2.5 rounded-full transition-colors duration-300 ${
                       status === "paused" ? "bg-amber-400"            :
-                      isError            ? "bg-red-500"               :
+                      isError             ? "bg-red-500"               :
                       isProcessing       ? "bg-blue-400 animate-pulse":
                       "bg-[#d4d4cf]"
                     }`} />
@@ -459,9 +512,7 @@ export default function AudioCapture() {
             {/* Footer */}
             <div className="px-7 pb-5">
               <p className="text-[10.5px] text-[#bbb] leading-relaxed">
-                Audio is processed exclusively on your local backend and never stored
-                beyond the active request. For clinical use only — always review
-                AI-generated notes before filing.
+                Audio is processed securely via background polling. Screen wake lock is active to prevent session interruption.
               </p>
             </div>
           </div>
