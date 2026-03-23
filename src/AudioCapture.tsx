@@ -571,12 +571,19 @@ export default function AudioCapture() {
 
       <div className="audio-capture-root min-h-screen bg-[#f7f7f5] text-[#202321] flex items-center justify-center px-4">
         <div className="w-full max-w-2xl bg-white rounded-[28px] border border-[#e8e8e5] shadow-[0_8px_30px_rgba(0,0,0,0.04)] overflow-hidden">
-          <div className="px-8 pt-8 pb-6 border-b border-[#ecece8]">
+          <div className="px-8 pt-8 pb-6 border-b border-[#ecece8] text-center">
+            <img
+              src="/metromind-logo.png"
+              alt="Metro Mind"
+              className="h-20 w-auto mx-auto mb-4"
+            />
+
             <div className="text-[12px] tracking-[0.22em] font-[700] text-[#2b9da0] uppercase">
               Metro Mind • Clinical
             </div>
+
             <h1 className="mt-2 text-[28px] leading-[1.1] font-[500] text-[#2c3433]">
-              Ambient AI Scribe
+               Ambient AI Scribe
             </h1>
           </div>
 
