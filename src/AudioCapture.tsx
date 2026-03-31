@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import NoteEditor, { type SoapNote } from "./NoteEditor";
+import { type ConsultationMetadata } from "./consultation";
 
 type RecorderStatus =
   | "idle"
@@ -181,14 +182,189 @@ interface FailedSegment {
 }
 
 type SegmentUploadError = Error & { segmentIndex?: number };
+type FinalizeSessionError = Error & { segmentEntries?: FailedSegment[] };
 
-export default function AudioCapture() {
+interface SessionProgress {
+  sessionStatus: string | null;
+  segmentsReceived: number | null;
+  segmentsTranscribed: number | null;
+  failedSegments: number | null;
+}
+
+const INITIAL_SESSION_PROGRESS: SessionProgress = {
+  sessionStatus: null,
+  segmentsReceived: null,
+  segmentsTranscribed: null,
+  failedSegments: null,
+};
+
+function collectSegmentIndices(value: unknown): number[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((entry): entry is number => typeof entry === "number" && Number.isFinite(entry))
+    .sort((a, b) => a - b);
+}
+
+function collectSegmentEntries(value: unknown, fallbackMessage: string): FailedSegment[] {
+  if (!Array.isArray(value)) return [];
+
+  return value
+    .map((entry) => {
+      if (!entry || typeof entry !== "object") return null;
+      const candidate = entry as Record<string, unknown>;
+      const segmentIndex =
+        typeof candidate.segmentIndex === "number" && Number.isFinite(candidate.segmentIndex)
+          ? candidate.segmentIndex
+          : typeof candidate.index === "number" && Number.isFinite(candidate.index)
+            ? candidate.index
+            : null;
+
+      if (segmentIndex === null) return null;
+
+      const directMessage =
+        typeof candidate.message === "string" && candidate.message.trim().length > 0
+          ? candidate.message
+          : null;
+      const lastError =
+        candidate.lastError && typeof candidate.lastError === "object"
+          ? (candidate.lastError as Record<string, unknown>)
+          : null;
+      const lastErrorMessage =
+        typeof lastError?.message === "string" && lastError.message.trim().length > 0
+          ? lastError.message
+          : null;
+
+      return {
+        segmentIndex,
+        message: lastErrorMessage ?? directMessage ?? fallbackMessage,
+      } satisfies FailedSegment;
+    })
+    .filter((entry): entry is FailedSegment => entry !== null)
+    .sort((a, b) => a.segmentIndex - b.segmentIndex);
+}
+
+function buildFinalizeSessionError(body: unknown, statusCode: number): FinalizeSessionError {
+  const response = body && typeof body === "object" ? (body as Record<string, unknown>) : {};
+  const rawError = response.error;
+
+  if (statusCode === 409 && rawError && typeof rawError === "object") {
+    const errorObj = rawError as Record<string, unknown>;
+    const code = typeof errorObj.code === "string" ? errorObj.code : "";
+    const backendMessage =
+      typeof errorObj.message === "string" && errorObj.message.trim().length > 0
+        ? errorObj.message
+        : "Unable to finalize this consultation yet.";
+
+    if (code === "SEGMENTS_PENDING") {
+      const pendingIndices = collectSegmentIndices(errorObj.pendingSegmentIndices);
+      const pendingEntries = collectSegmentEntries(
+        errorObj.pendingSegments,
+        "Still processing. Please wait a moment and try again."
+      );
+      const indices = pendingIndices.length
+        ? pendingIndices
+        : pendingEntries.map((entry) => entry.segmentIndex);
+      const suffix = indices.length ? ` Pending segments: ${indices.map((i) => `#${i}`).join(", ")}.` : "";
+      const error = new Error(`${backendMessage}${suffix}`) as FinalizeSessionError;
+      error.segmentEntries =
+        pendingEntries.length > 0
+          ? pendingEntries
+          : indices.map((segmentIndex) => ({
+              segmentIndex,
+              message: "Still processing. Please wait a moment and try again.",
+            }));
+      return error;
+    }
+
+    if (code === "SEGMENTS_FAILED") {
+      const failedIndices = collectSegmentIndices(errorObj.failedSegmentIndices);
+      const failedEntries = collectSegmentEntries(
+        errorObj.failedSegments,
+        "Segment failed processing and needs re-recording."
+      );
+      const indices = failedIndices.length
+        ? failedIndices
+        : failedEntries.map((entry) => entry.segmentIndex);
+      const suffix = indices.length ? ` Failed segments: ${indices.map((i) => `#${i}`).join(", ")}.` : "";
+      const error = new Error(`${backendMessage}${suffix}`) as FinalizeSessionError;
+      error.segmentEntries =
+        failedEntries.length > 0
+          ? failedEntries
+          : indices.map((segmentIndex) => ({
+              segmentIndex,
+              message: "Segment failed processing and needs re-recording.",
+            }));
+      return error;
+    }
+  }
+
+  const legacyMessage =
+    typeof rawError === "string"
+      ? rawError
+      : rawError &&
+          typeof rawError === "object" &&
+          typeof (rawError as Record<string, unknown>).message === "string"
+        ? ((rawError as Record<string, unknown>).message as string)
+        : null;
+
+  return new Error(legacyMessage ?? "Failed to finalize session.");
+}
+
+function asCount(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function asText(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function mapSessionProgress(payload: unknown): SessionProgress {
+  const root = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
+  const progress =
+    root.progress && typeof root.progress === "object"
+      ? (root.progress as Record<string, unknown>)
+      : {};
+
+  return {
+    sessionStatus:
+      asText(root.status) ??
+      asText(progress.status) ??
+      asText(root.sessionStatus) ??
+      asText(progress.sessionStatus),
+    segmentsReceived:
+      asCount(root.segmentsReceived) ??
+      asCount(progress.segmentsReceived) ??
+      asCount(root.receivedSegments) ??
+      asCount(progress.receivedSegments),
+    segmentsTranscribed:
+      asCount(root.segmentsTranscribed) ??
+      asCount(progress.segmentsTranscribed) ??
+      asCount(root.transcribedSegments) ??
+      asCount(progress.transcribedSegments),
+    failedSegments:
+      asCount(root.failedSegments) ??
+      asCount(progress.failedSegments) ??
+      asCount(root.segmentsFailed) ??
+      asCount(progress.segmentsFailed),
+  };
+}
+
+export default function AudioCapture({
+  consultationMetadata,
+}: {
+  consultationMetadata?: ConsultationMetadata | null;
+}) {
   const [state, dispatch] = useReducer(reducer, initialState);
   const { status, elapsedSeconds, errorMessage } = state;
 
   const [noteData, setNoteData] = useState<SoapNote | null>(null);
   const [analyser, setAnalyser] = useState<AnalyserNode | null>(null);
   const [failedSegments, setFailedSegments] = useState<FailedSegment[]>([]);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessionProgress, setSessionProgress] = useState<SessionProgress>(INITIAL_SESSION_PROGRESS);
+  const [isRetryingFailedSegments, setIsRetryingFailedSegments] = useState(false);
+  const [retryStatusMessage, setRetryStatusMessage] = useState<string | null>(null);
+  const [waitingForRetryProcessing, setWaitingForRetryProcessing] = useState(false);
 
   const sessionIdRef = useRef<string | null>(null);
   const activeRecorderRef = useRef<MediaRecorder | null>(null);
@@ -250,8 +426,21 @@ export default function AudioCapture() {
   }, [teardownStream]);
 
   const createSession = useCallback(async (): Promise<string> => {
+    const payload = {
+      patientName: consultationMetadata?.patientName?.trim() ?? "",
+      chiefComplaint: consultationMetadata?.chiefComplaint?.trim() ?? "",
+      preferredLanguage: consultationMetadata?.preferredLanguage?.trim() ?? "",
+    };
+
+    const hasMetadata =
+      payload.patientName.length > 0 ||
+      payload.chiefComplaint.length > 0 ||
+      payload.preferredLanguage.length > 0;
+
     const res = await fetch(`${BACKEND_BASE}/sessions`, {
       method: "POST",
+      headers: hasMetadata ? { "Content-Type": "application/json" } : undefined,
+      body: hasMetadata ? JSON.stringify(payload) : undefined,
     });
 
     if (!res.ok) {
@@ -261,7 +450,7 @@ export default function AudioCapture() {
 
     const json = (await res.json()) as { sessionId: string };
     return json.sessionId;
-  }, []);
+  }, [consultationMetadata]);
 
   const uploadSegment = useCallback(
     async (sessionId: string, blob: Blob, segmentIndex: number) => {
@@ -362,8 +551,41 @@ export default function AudioCapture() {
 
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
-      throw new Error(body?.error ?? "Failed to finalize session.");
+      throw buildFinalizeSessionError(body, res.status);
     }
+  }, []);
+
+  const retryFailedSegment = useCallback(async (activeSessionId: string, segmentIndex: number) => {
+    const res = await fetch(
+      `${BACKEND_BASE}/sessions/${activeSessionId}/segments/${segmentIndex}/retry`,
+      {
+        method: "POST",
+      }
+    );
+
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      const structuredError = body?.error;
+      const message =
+        typeof structuredError?.message === "string" && structuredError.message.trim().length > 0
+          ? structuredError.message
+          : typeof structuredError === "string" && structuredError.trim().length > 0
+            ? structuredError
+            : `Unable to retry segment #${segmentIndex}.`;
+      throw new Error(message);
+    }
+  }, []);
+
+  const fetchSessionStatus = useCallback(async (activeSessionId: string) => {
+    const res = await fetch(`${BACKEND_BASE}/sessions/${activeSessionId}/status`);
+
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body?.error ?? "Failed to fetch session status.");
+    }
+
+    const payload = await res.json();
+    setSessionProgress(mapSessionProgress(payload));
   }, []);
 
   const pollForResult = useCallback(async (sessionId: string): Promise<SoapNote> => {
@@ -506,6 +728,8 @@ export default function AudioCapture() {
       activeUploadCountRef.current = 0;
       failedSegmentMessagesRef.current = new Map();
       setFailedSegments([]);
+      setRetryStatusMessage(null);
+      setWaitingForRetryProcessing(false);
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       activeStreamRef.current = stream;
@@ -520,6 +744,8 @@ export default function AudioCapture() {
 
       const sessionId = await createSession();
       sessionIdRef.current = sessionId;
+      setSessionId(sessionId);
+      setSessionProgress(INITIAL_SESSION_PROGRESS);
 
       const mimeType = getBestMimeType();
       currentMimeTypeRef.current = mimeType || "audio/webm";
@@ -627,9 +853,17 @@ export default function AudioCapture() {
       }
 
       setNoteData(note);
+      setRetryStatusMessage(null);
+      setWaitingForRetryProcessing(false);
       teardownStream();
     } catch (error) {
+      const finalizeError = error as FinalizeSessionError;
       teardownStream();
+      if (finalizeError.segmentEntries && finalizeError.segmentEntries.length > 0) {
+        setFailedSegments(finalizeError.segmentEntries);
+      }
+      setRetryStatusMessage(null);
+      setWaitingForRetryProcessing(false);
       dispatch({
         type: "ERROR",
         message: error instanceof Error ? error.message : "Failed to stop session.",
@@ -647,12 +881,127 @@ export default function AudioCapture() {
   const handleReset = useCallback(() => {
     teardownStream();
     sessionIdRef.current = null;
+    setSessionId(null);
+    setSessionProgress(INITIAL_SESSION_PROGRESS);
+    setRetryStatusMessage(null);
+    setIsRetryingFailedSegments(false);
+    setWaitingForRetryProcessing(false);
     segmentIndexRef.current = 0;
     stoppingRef.current = false;
     pausedRef.current = false;
     setNoteData(null);
     dispatch({ type: "RESET" });
   }, [teardownStream]);
+
+  const handleRetryFailedSegments = useCallback(async () => {
+    const activeSessionId = sessionIdRef.current ?? sessionId;
+    if (!activeSessionId || failedSegments.length === 0) return;
+
+    const uniqueIndices = Array.from(
+      new Set(failedSegments.map((segment) => segment.segmentIndex))
+    ).sort((a, b) => a - b);
+
+    setIsRetryingFailedSegments(true);
+    setRetryStatusMessage("Queueing retries for failed segments...");
+
+    const retryFailures: FailedSegment[] = [];
+
+    for (let i = 0; i < uniqueIndices.length; i += 1) {
+      const segmentIndex = uniqueIndices[i];
+      setRetryStatusMessage(`Retrying segment ${i + 1} of ${uniqueIndices.length}...`);
+      try {
+        await retryFailedSegment(activeSessionId, segmentIndex);
+      } catch (error) {
+        retryFailures.push({
+          segmentIndex,
+          message: error instanceof Error ? error.message : "Retry request failed.",
+        });
+      }
+    }
+
+    if (retryFailures.length > 0) {
+      setFailedSegments(retryFailures);
+      setRetryStatusMessage(
+        `Some retries could not be queued (${retryFailures.length}/${uniqueIndices.length}).`
+      );
+      setWaitingForRetryProcessing(false);
+      setIsRetryingFailedSegments(false);
+      return;
+    }
+
+    setFailedSegments([]);
+    setWaitingForRetryProcessing(true);
+    setRetryStatusMessage("Retries queued. Waiting for segment processing to finish.");
+    setIsRetryingFailedSegments(false);
+  }, [failedSegments, retryFailedSegment, sessionId]);
+
+  const handleTryFinalizeAgain = useCallback(async () => {
+    const activeSessionId = sessionIdRef.current ?? sessionId;
+    if (!activeSessionId) return;
+
+    try {
+      setRetryStatusMessage("Trying to finalize consultation...");
+      dispatch({ type: "FINALIZING" });
+      await finalizeSession(activeSessionId);
+
+      dispatch({ type: "PROCESS" });
+      const note = await pollForResult(activeSessionId);
+
+      if (!note || typeof note !== "object" || !("soap_note" in note)) {
+        throw new Error("Backend returned an invalid SOAP note shape.");
+      }
+
+      setNoteData(note);
+      setRetryStatusMessage(null);
+      setWaitingForRetryProcessing(false);
+      teardownStream();
+    } catch (error) {
+      const finalizeError = error as FinalizeSessionError;
+      if (finalizeError.segmentEntries && finalizeError.segmentEntries.length > 0) {
+        setFailedSegments(finalizeError.segmentEntries);
+      }
+      setWaitingForRetryProcessing(true);
+      dispatch({
+        type: "ERROR",
+        message: error instanceof Error ? error.message : "Unable to finalize session.",
+      });
+    }
+  }, [finalizeSession, pollForResult, sessionId, teardownStream]);
+
+  useEffect(() => {
+    const shouldPoll =
+      status === "recording" ||
+      status === "uploading_segment" ||
+      status === "finalizing" ||
+      status === "processing" ||
+      waitingForRetryProcessing;
+
+    if (!shouldPoll || !sessionId) return;
+
+    let cancelled = false;
+    let timeoutId: number | null = null;
+
+    const poll = async () => {
+      try {
+        await fetchSessionStatus(sessionId);
+      } catch {
+        // Keep status polling silent in UI; main recorder flow handles surfaced errors.
+      } finally {
+        if (!cancelled) {
+          timeoutId = window.setTimeout(poll, 2500);
+        }
+      }
+    };
+
+    poll();
+
+    return () => {
+      cancelled = true;
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [fetchSessionStatus, sessionId, status, waitingForRetryProcessing]);
 
   if (noteData) {
     return <NoteEditor data={noteData} onNewSession={handleReset} />;
@@ -683,6 +1032,10 @@ export default function AudioCapture() {
                 : status === "error"
                   ? "Error"
                   : "Ready";
+
+  const patientLabel = consultationMetadata?.patientName?.trim() || "Not provided";
+  const complaintLabel = consultationMetadata?.chiefComplaint?.trim() || "Not provided";
+  const languageLabel = consultationMetadata?.preferredLanguage?.trim() || "Not provided";
 
   return (
     <>
@@ -745,10 +1098,36 @@ export default function AudioCapture() {
               <Waveform analyser={analyser} active={isRecording} />
             </div>
 
+            {sessionId && !isIdle && !isError && (
+              <div className="mt-4 rounded-[14px] border border-[#ecece8] bg-[#fcfcfb] px-4 py-3 text-[12px] text-[#69706c]">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  <div>
+                    <div className="text-[#9aa09b] uppercase tracking-[0.08em] text-[10px]">Session</div>
+                    <div className="text-[#3b4341] font-[500]">{sessionProgress.sessionStatus ?? "—"}</div>
+                  </div>
+                  <div>
+                    <div className="text-[#9aa09b] uppercase tracking-[0.08em] text-[10px]">Received</div>
+                    <div className="text-[#3b4341] font-[500]">{sessionProgress.segmentsReceived ?? "—"}</div>
+                  </div>
+                  <div>
+                    <div className="text-[#9aa09b] uppercase tracking-[0.08em] text-[10px]">Transcribed</div>
+                    <div className="text-[#3b4341] font-[500]">{sessionProgress.segmentsTranscribed ?? "—"}</div>
+                  </div>
+                  <div>
+                    <div className="text-[#9aa09b] uppercase tracking-[0.08em] text-[10px]">Failed</div>
+                    <div className="text-[#3b4341] font-[500]">{sessionProgress.failedSegments ?? "—"}</div>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {isError && (
               <div className="mt-8 rounded-[20px] border border-red-200 bg-red-50 px-6 py-5">
                 <div className="text-[16px] font-[600] text-red-800">Something went wrong</div>
                 <div className="mt-2 text-[15px] leading-7 text-red-700">{errorMessage}</div>
+                {retryStatusMessage && (
+                  <div className="mt-2 text-[14px] text-red-700">{retryStatusMessage}</div>
+                )}
                 {failedSegments.length > 0 && (
                   <ul className="mt-3 list-disc pl-5 space-y-1 text-[14px] text-red-700">
                     {failedSegments.map((failure) => (
@@ -757,6 +1136,23 @@ export default function AudioCapture() {
                       </li>
                     ))}
                   </ul>
+                )}
+                {failedSegments.length > 0 && sessionId && (
+                  <button
+                    onClick={handleRetryFailedSegments}
+                    disabled={isRetryingFailedSegments}
+                    className="mt-4 rounded-[12px] border border-red-200 bg-white px-4 py-2 text-[14px] font-[500] text-red-700 hover:bg-red-100 transition disabled:opacity-60"
+                  >
+                    {isRetryingFailedSegments ? "Retrying failed segments..." : "Retry failed segments"}
+                  </button>
+                )}
+                {sessionId && waitingForRetryProcessing && (
+                  <button
+                    onClick={handleTryFinalizeAgain}
+                    className="mt-3 rounded-[12px] border border-red-200 bg-white px-4 py-2 text-[14px] font-[500] text-red-700 hover:bg-red-100 transition"
+                  >
+                    Try finalize again
+                  </button>
                 )}
               </div>
             )}
@@ -793,6 +1189,10 @@ export default function AudioCapture() {
             <div className="mt-8 text-[13px] leading-7 text-[#a5a8a3]">
               Audio is uploaded in rolling segments during the live consultation and then assembled
               into a final AI-generated draft for clinician review.
+            </div>
+            <div className="mt-3 rounded-[12px] border border-[#efefeb] bg-[#fcfcfb] px-4 py-2.5 text-[12px] text-[#808580]">
+              <span className="font-[500] text-[#6e746f]">Consultation context:</span>{" "}
+              Patient {patientLabel} · Complaint {complaintLabel} · Language {languageLabel}
             </div>
           </div>
         </div>
