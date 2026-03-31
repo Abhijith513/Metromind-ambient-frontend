@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import NoteEditor, { type SoapNote } from "./NoteEditor";
+import { type ConsultationMetadata } from "./consultation";
 
 type RecorderStatus =
   | "idle"
@@ -182,13 +183,72 @@ interface FailedSegment {
 
 type SegmentUploadError = Error & { segmentIndex?: number };
 
-export default function AudioCapture() {
+interface SessionProgress {
+  sessionStatus: string | null;
+  segmentsReceived: number | null;
+  segmentsTranscribed: number | null;
+  failedSegments: number | null;
+}
+
+const INITIAL_SESSION_PROGRESS: SessionProgress = {
+  sessionStatus: null,
+  segmentsReceived: null,
+  segmentsTranscribed: null,
+  failedSegments: null,
+};
+
+function asCount(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function asText(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function mapSessionProgress(payload: unknown): SessionProgress {
+  const root = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
+  const progress =
+    root.progress && typeof root.progress === "object"
+      ? (root.progress as Record<string, unknown>)
+      : {};
+
+  return {
+    sessionStatus:
+      asText(root.status) ??
+      asText(progress.status) ??
+      asText(root.sessionStatus) ??
+      asText(progress.sessionStatus),
+    segmentsReceived:
+      asCount(root.segmentsReceived) ??
+      asCount(progress.segmentsReceived) ??
+      asCount(root.receivedSegments) ??
+      asCount(progress.receivedSegments),
+    segmentsTranscribed:
+      asCount(root.segmentsTranscribed) ??
+      asCount(progress.segmentsTranscribed) ??
+      asCount(root.transcribedSegments) ??
+      asCount(progress.transcribedSegments),
+    failedSegments:
+      asCount(root.failedSegments) ??
+      asCount(progress.failedSegments) ??
+      asCount(root.segmentsFailed) ??
+      asCount(progress.segmentsFailed),
+  };
+}
+
+export default function AudioCapture({
+  consultationMetadata,
+}: {
+  consultationMetadata?: ConsultationMetadata | null;
+}) {
   const [state, dispatch] = useReducer(reducer, initialState);
   const { status, elapsedSeconds, errorMessage } = state;
 
   const [noteData, setNoteData] = useState<SoapNote | null>(null);
   const [analyser, setAnalyser] = useState<AnalyserNode | null>(null);
   const [failedSegments, setFailedSegments] = useState<FailedSegment[]>([]);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessionProgress, setSessionProgress] = useState<SessionProgress>(INITIAL_SESSION_PROGRESS);
 
   const sessionIdRef = useRef<string | null>(null);
   const activeRecorderRef = useRef<MediaRecorder | null>(null);
@@ -250,8 +310,21 @@ export default function AudioCapture() {
   }, [teardownStream]);
 
   const createSession = useCallback(async (): Promise<string> => {
+    const payload = {
+      patientName: consultationMetadata?.patientName?.trim() ?? "",
+      chiefComplaint: consultationMetadata?.chiefComplaint?.trim() ?? "",
+      preferredLanguage: consultationMetadata?.preferredLanguage?.trim() ?? "",
+    };
+
+    const hasMetadata =
+      payload.patientName.length > 0 ||
+      payload.chiefComplaint.length > 0 ||
+      payload.preferredLanguage.length > 0;
+
     const res = await fetch(`${BACKEND_BASE}/sessions`, {
       method: "POST",
+      headers: hasMetadata ? { "Content-Type": "application/json" } : undefined,
+      body: hasMetadata ? JSON.stringify(payload) : undefined,
     });
 
     if (!res.ok) {
@@ -261,7 +334,7 @@ export default function AudioCapture() {
 
     const json = (await res.json()) as { sessionId: string };
     return json.sessionId;
-  }, []);
+  }, [consultationMetadata]);
 
   const uploadSegment = useCallback(
     async (sessionId: string, blob: Blob, segmentIndex: number) => {
@@ -364,6 +437,18 @@ export default function AudioCapture() {
       const body = await res.json().catch(() => ({}));
       throw new Error(body?.error ?? "Failed to finalize session.");
     }
+  }, []);
+
+  const fetchSessionStatus = useCallback(async (activeSessionId: string) => {
+    const res = await fetch(`${BACKEND_BASE}/sessions/${activeSessionId}/status`);
+
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body?.error ?? "Failed to fetch session status.");
+    }
+
+    const payload = await res.json();
+    setSessionProgress(mapSessionProgress(payload));
   }, []);
 
   const pollForResult = useCallback(async (sessionId: string): Promise<SoapNote> => {
@@ -520,6 +605,8 @@ export default function AudioCapture() {
 
       const sessionId = await createSession();
       sessionIdRef.current = sessionId;
+      setSessionId(sessionId);
+      setSessionProgress(INITIAL_SESSION_PROGRESS);
 
       const mimeType = getBestMimeType();
       currentMimeTypeRef.current = mimeType || "audio/webm";
@@ -647,12 +734,48 @@ export default function AudioCapture() {
   const handleReset = useCallback(() => {
     teardownStream();
     sessionIdRef.current = null;
+    setSessionId(null);
+    setSessionProgress(INITIAL_SESSION_PROGRESS);
     segmentIndexRef.current = 0;
     stoppingRef.current = false;
     pausedRef.current = false;
     setNoteData(null);
     dispatch({ type: "RESET" });
   }, [teardownStream]);
+
+  useEffect(() => {
+    const shouldPoll =
+      status === "recording" ||
+      status === "uploading_segment" ||
+      status === "finalizing" ||
+      status === "processing";
+
+    if (!shouldPoll || !sessionId) return;
+
+    let cancelled = false;
+    let timeoutId: number | null = null;
+
+    const poll = async () => {
+      try {
+        await fetchSessionStatus(sessionId);
+      } catch {
+        // Keep status polling silent in UI; main recorder flow handles surfaced errors.
+      } finally {
+        if (!cancelled) {
+          timeoutId = window.setTimeout(poll, 2500);
+        }
+      }
+    };
+
+    poll();
+
+    return () => {
+      cancelled = true;
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [fetchSessionStatus, sessionId, status]);
 
   if (noteData) {
     return <NoteEditor data={noteData} onNewSession={handleReset} />;
@@ -683,6 +806,10 @@ export default function AudioCapture() {
                 : status === "error"
                   ? "Error"
                   : "Ready";
+
+  const patientLabel = consultationMetadata?.patientName?.trim() || "Not provided";
+  const complaintLabel = consultationMetadata?.chiefComplaint?.trim() || "Not provided";
+  const languageLabel = consultationMetadata?.preferredLanguage?.trim() || "Not provided";
 
   return (
     <>
@@ -745,6 +872,29 @@ export default function AudioCapture() {
               <Waveform analyser={analyser} active={isRecording} />
             </div>
 
+            {sessionId && !isIdle && !isError && (
+              <div className="mt-4 rounded-[14px] border border-[#ecece8] bg-[#fcfcfb] px-4 py-3 text-[12px] text-[#69706c]">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  <div>
+                    <div className="text-[#9aa09b] uppercase tracking-[0.08em] text-[10px]">Session</div>
+                    <div className="text-[#3b4341] font-[500]">{sessionProgress.sessionStatus ?? "—"}</div>
+                  </div>
+                  <div>
+                    <div className="text-[#9aa09b] uppercase tracking-[0.08em] text-[10px]">Received</div>
+                    <div className="text-[#3b4341] font-[500]">{sessionProgress.segmentsReceived ?? "—"}</div>
+                  </div>
+                  <div>
+                    <div className="text-[#9aa09b] uppercase tracking-[0.08em] text-[10px]">Transcribed</div>
+                    <div className="text-[#3b4341] font-[500]">{sessionProgress.segmentsTranscribed ?? "—"}</div>
+                  </div>
+                  <div>
+                    <div className="text-[#9aa09b] uppercase tracking-[0.08em] text-[10px]">Failed</div>
+                    <div className="text-[#3b4341] font-[500]">{sessionProgress.failedSegments ?? "—"}</div>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {isError && (
               <div className="mt-8 rounded-[20px] border border-red-200 bg-red-50 px-6 py-5">
                 <div className="text-[16px] font-[600] text-red-800">Something went wrong</div>
@@ -793,6 +943,10 @@ export default function AudioCapture() {
             <div className="mt-8 text-[13px] leading-7 text-[#a5a8a3]">
               Audio is uploaded in rolling segments during the live consultation and then assembled
               into a final AI-generated draft for clinician review.
+            </div>
+            <div className="mt-3 rounded-[12px] border border-[#efefeb] bg-[#fcfcfb] px-4 py-2.5 text-[12px] text-[#808580]">
+              <span className="font-[500] text-[#6e746f]">Consultation context:</span>{" "}
+              Patient {patientLabel} · Complaint {complaintLabel} · Language {languageLabel}
             </div>
           </div>
         </div>
