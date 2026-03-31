@@ -172,6 +172,15 @@ const BACKEND_BASE =
   "https://metromind-ambient-api.onrender.com/api";
 
 const SEGMENT_DURATION_MS = 30000;
+const SEGMENT_UPLOAD_CONCURRENCY = 2;
+const MAX_QUEUED_SEGMENTS = 12;
+
+interface FailedSegment {
+  segmentIndex: number;
+  message: string;
+}
+
+type SegmentUploadError = Error & { segmentIndex?: number };
 
 export default function AudioCapture() {
   const [state, dispatch] = useReducer(reducer, initialState);
@@ -179,6 +188,7 @@ export default function AudioCapture() {
 
   const [noteData, setNoteData] = useState<SoapNote | null>(null);
   const [analyser, setAnalyser] = useState<AnalyserNode | null>(null);
+  const [failedSegments, setFailedSegments] = useState<FailedSegment[]>([]);
 
   const sessionIdRef = useRef<string | null>(null);
   const activeRecorderRef = useRef<MediaRecorder | null>(null);
@@ -191,7 +201,22 @@ export default function AudioCapture() {
   const stoppingRef = useRef<boolean>(false);
   const pausedRef = useRef<boolean>(false);
   const currentMimeTypeRef = useRef<string>("audio/webm");
-  const pendingUploadsRef = useRef<Promise<void>[]>([]);
+  const pendingUploadsRef = useRef<Set<Promise<void>>>(new Set());
+  const queuedUploadsRef = useRef<
+    Array<{ sessionId: string; blob: Blob; segmentIndex: number; resolve: () => void; reject: (error: unknown) => void }>
+  >([]);
+  const activeUploadCountRef = useRef<number>(0);
+  const failedSegmentMessagesRef = useRef<Map<number, string>>(new Map());
+
+  const recordFailedSegment = useCallback((segmentIndex: number, message: string) => {
+    failedSegmentMessagesRef.current.set(segmentIndex, message);
+    setFailedSegments((prev) => {
+      const withoutCurrent = prev.filter((entry) => entry.segmentIndex !== segmentIndex);
+      return [...withoutCurrent, { segmentIndex, message }].sort(
+        (a, b) => a.segmentIndex - b.segmentIndex
+      );
+    });
+  }, []);
 
   const clearTimers = useCallback(() => {
     if (tickerRef.current !== null) {
@@ -210,10 +235,14 @@ export default function AudioCapture() {
     activeStreamRef.current = null;
     activeRecorderRef.current = null;
     currentSegmentChunksRef.current = [];
-    pendingUploadsRef.current = [];
+    pendingUploadsRef.current = new Set();
+    queuedUploadsRef.current = [];
+    activeUploadCountRef.current = 0;
+    failedSegmentMessagesRef.current = new Map();
     audioCtxRef.current?.close().catch(() => {});
     audioCtxRef.current = null;
     setAnalyser(null);
+    setFailedSegments([]);
   }, [clearTimers]);
 
   useEffect(() => {
@@ -253,10 +282,77 @@ export default function AudioCapture() {
 
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
-        throw new Error(body?.error ?? "Failed to upload segment.");
+        const structuredError = body?.error;
+        const backendMessage =
+          typeof structuredError?.message === "string" && structuredError.message.trim().length > 0
+            ? structuredError.message
+            : typeof structuredError === "string" && structuredError.trim().length > 0
+              ? structuredError
+              : "Failed to upload segment.";
+
+        const uploadError = new Error(`${backendMessage} (HTTP ${res.status})`) as SegmentUploadError;
+        if (typeof structuredError?.segmentIndex === "number") {
+          uploadError.segmentIndex = structuredError.segmentIndex;
+        } else if (typeof segmentIndex === "number") {
+          uploadError.segmentIndex = segmentIndex;
+        }
+
+        throw uploadError;
       }
     },
     []
+  );
+
+  const processUploadQueue = useCallback(() => {
+    while (
+      activeUploadCountRef.current < SEGMENT_UPLOAD_CONCURRENCY &&
+      queuedUploadsRef.current.length > 0
+    ) {
+      const job = queuedUploadsRef.current.shift();
+      if (!job) return;
+
+      activeUploadCountRef.current += 1;
+      uploadSegment(job.sessionId, job.blob, job.segmentIndex)
+        .then(() => {
+          console.log(`Uploaded segment ${job.segmentIndex}`);
+          job.resolve();
+        })
+        .catch((error) => {
+          const uploadError = error as SegmentUploadError;
+          const failedSegmentIndex =
+            typeof uploadError.segmentIndex === "number"
+              ? uploadError.segmentIndex
+              : job.segmentIndex;
+          const message =
+            error instanceof Error ? error.message : "Failed to upload segment.";
+          console.error(`Failed to upload segment ${failedSegmentIndex}`, error);
+          recordFailedSegment(failedSegmentIndex, message);
+          job.reject(new Error(`Segment ${failedSegmentIndex}: ${message}`));
+        })
+        .finally(() => {
+          activeUploadCountRef.current = Math.max(0, activeUploadCountRef.current - 1);
+          processUploadQueue();
+        });
+    }
+  }, [recordFailedSegment, uploadSegment]);
+
+  const enqueueSegmentUpload = useCallback(
+    (sessionId: string, blob: Blob, segmentIndex: number): Promise<void> => {
+      if (
+        queuedUploadsRef.current.length + activeUploadCountRef.current >=
+        MAX_QUEUED_SEGMENTS + SEGMENT_UPLOAD_CONCURRENCY
+      ) {
+        const message = `Upload queue is full (${MAX_QUEUED_SEGMENTS} waiting).`;
+        recordFailedSegment(segmentIndex, message);
+        return Promise.reject(new Error(`Segment ${segmentIndex}: ${message}`));
+      }
+
+      return new Promise<void>((resolve, reject) => {
+        queuedUploadsRef.current.push({ sessionId, blob, segmentIndex, resolve, reject });
+        processUploadQueue();
+      });
+    },
+    [processUploadQueue, recordFailedSegment]
   );
 
   const finalizeSession = useCallback(async (sessionId: string) => {
@@ -364,20 +460,16 @@ export default function AudioCapture() {
       }
 
       if (blob.size > 0) {
-        const uploadPromise = uploadSegment(sessionId, blob, currentIndex)
-          .then(() => {
-            console.log(`Uploaded segment ${currentIndex}`);
-          })
-          .catch((error) => {
-            console.error(`Failed to upload segment ${currentIndex}`, error);
-            throw error;
-          });
+        const uploadPromise = enqueueSegmentUpload(sessionId, blob, currentIndex);
 
-        pendingUploadsRef.current.push(uploadPromise);
+        pendingUploadsRef.current.add(uploadPromise);
+        uploadPromise.finally(() => {
+          pendingUploadsRef.current.delete(uploadPromise);
+        });
         segmentIndexRef.current += 1;
       }
     },
-    [startSegmentRecorder, uploadSegment]
+    [enqueueSegmentUpload, startSegmentRecorder]
   );
 
   const scheduleSegmentRotation = useCallback(() => {
@@ -388,10 +480,8 @@ export default function AudioCapture() {
       if (!sessionId || pausedRef.current || stoppingRef.current) return;
 
       try {
-        dispatch({ type: "UPLOADING_SEGMENT" });
         await stopCurrentSegmentAndContinue(false);
         if (!pausedRef.current && !stoppingRef.current) {
-          dispatch({ type: "START" });
           scheduleSegmentRotation();
         }
       } catch (error) {
@@ -411,7 +501,11 @@ export default function AudioCapture() {
       pausedRef.current = false;
       segmentIndexRef.current = 0;
       currentSegmentChunksRef.current = [];
-      pendingUploadsRef.current = [];
+      pendingUploadsRef.current = new Set();
+      queuedUploadsRef.current = [];
+      activeUploadCountRef.current = 0;
+      failedSegmentMessagesRef.current = new Map();
+      setFailedSegments([]);
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       activeStreamRef.current = stream;
@@ -507,12 +601,18 @@ export default function AudioCapture() {
         await stopCurrentSegmentAndContinue(true);
       }
 
-      const uploadResults = await Promise.allSettled(pendingUploadsRef.current);
-      pendingUploadsRef.current = [];
+      const uploadResults = await Promise.allSettled(Array.from(pendingUploadsRef.current));
+      pendingUploadsRef.current = new Set();
 
       const failedUploads = uploadResults.filter((r) => r.status === "rejected");
       if (failedUploads.length > 0) {
-        throw new Error(`${failedUploads.length} segment upload(s) failed before finalization.`);
+        const failedDetails = Array.from(failedSegmentMessagesRef.current.entries())
+          .sort((a, b) => a[0] - b[0])
+          .map(([segmentIndex, message]) => `#${segmentIndex}: ${message}`)
+          .join(" | ");
+        throw new Error(
+          `Unable to finalize: ${failedUploads.length} segment upload(s) failed. ${failedDetails}`
+        );
       }
 
       dispatch({ type: "FINALIZING" });
@@ -649,6 +749,15 @@ export default function AudioCapture() {
               <div className="mt-8 rounded-[20px] border border-red-200 bg-red-50 px-6 py-5">
                 <div className="text-[16px] font-[600] text-red-800">Something went wrong</div>
                 <div className="mt-2 text-[15px] leading-7 text-red-700">{errorMessage}</div>
+                {failedSegments.length > 0 && (
+                  <ul className="mt-3 list-disc pl-5 space-y-1 text-[14px] text-red-700">
+                    {failedSegments.map((failure) => (
+                      <li key={failure.segmentIndex}>
+                        Segment #{failure.segmentIndex}: {failure.message}
+                      </li>
+                    ))}
+                  </ul>
+                )}
               </div>
             )}
 
